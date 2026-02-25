@@ -1,0 +1,326 @@
+# ============================================================
+# Kubernetes Deployment - Weather ML API
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: weather-ml
+  labels:
+    app: weather-forecast
+    team: mlops
+
+---
+# ─── ConfigMap ────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: weather-api-config
+  namespace: weather-ml
+data:
+  APP_NAME: "Weather Forecast ML API"
+  DEBUG: "false"
+  WORKERS: "4"
+  MODEL_STAGE: "Production"
+  CACHE_TTL: "3600"
+  KAFKA_WEATHER_TOPIC: "weather-data"
+  LOG_LEVEL: "INFO"
+
+---
+# ─── Secret (use sealed-secrets or vault in production) ───────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: weather-api-secrets
+  namespace: weather-ml
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql://weather:weather123@postgres-service:5432/weatherdb"
+  REDIS_URL: "redis://redis-service:6379/0"
+  OPENWEATHER_API_KEY: "your-api-key-here"
+  AWS_ACCESS_KEY_ID: "your-aws-key"
+  AWS_SECRET_ACCESS_KEY: "your-aws-secret"
+
+---
+# ─── Deployment ──────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weather-api
+  namespace: weather-ml
+  labels:
+    app: weather-api
+    version: "1.0.0"
+    component: api
+  annotations:
+    kubernetes.io/change-cause: "Initial deployment v1.0.0"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: weather-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: weather-api
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: weather-api-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgres-service 5432; do echo waiting for DB; sleep 2; done']
+        - name: wait-for-redis
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redis-service 6379; do echo waiting for Redis; sleep 2; done']
+
+      containers:
+        - name: weather-api
+          image: your-registry/weather-ml-api:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: weather-api-config
+            - secretRef:
+                name: weather-api-secrets
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 10
+
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+              readOnly: true
+            - name: tmp-dir
+              mountPath: /tmp
+
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: model-storage-pvc
+        - name: tmp-dir
+          emptyDir: {}
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - weather-api
+                topologyKey: kubernetes.io/hostname
+
+---
+# ─── Service ─────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: weather-api-service
+  namespace: weather-ml
+  labels:
+    app: weather-api
+spec:
+  type: ClusterIP
+  selector:
+    app: weather-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      protocol: TCP
+
+---
+# ─── Ingress ─────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: weather-api-ingress
+  namespace: weather-ml
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - weather-api.example.com
+      secretName: weather-api-tls
+  rules:
+    - host: weather-api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: weather-api-service
+                port:
+                  number: 80
+
+---
+# ─── HorizontalPodAutoscaler ─────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: weather-api-hpa
+  namespace: weather-ml
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: weather-api
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 120
+
+---
+# ─── PodDisruptionBudget ─────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: weather-api-pdb
+  namespace: weather-ml
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: weather-api
+
+---
+# ─── ServiceAccount ──────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weather-api-sa
+  namespace: weather-ml
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/weather-api-role
+
+---
+# ─── PVC for Model Storage ────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-storage-pvc
+  namespace: weather-ml
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: efs-sc  # AWS EFS for ReadOnlyMany
+
+---
+# ─── CronJob: Model Retraining ────────────────────────────────
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: weather-model-retrain
+  namespace: weather-ml
+spec:
+  schedule: "0 2 * * 0"  # Weekly on Sunday at 2 AM
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: model-trainer
+              image: your-registry/weather-ml-trainer:1.0.0
+              command: ["python", "model/train.py"]
+              resources:
+                requests:
+                  memory: "4Gi"
+                  cpu: "2000m"
+                limits:
+                  memory: "8Gi"
+                  cpu: "4000m"
+              env:
+                - name: MLFLOW_TRACKING_URI
+                  value: "http://mlflow-service:5000"
