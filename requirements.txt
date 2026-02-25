@@ -1,0 +1,50 @@
+# ─── Core API ────────────────────────────────────────────────
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+
+# ─── ML & Data Science ───────────────────────────────────────
+scikit-learn==1.4.0
+xgboost==2.0.3
+lightgbm==4.3.0
+numpy==1.26.3
+pandas==2.1.4
+scipy==1.12.0
+joblib==1.3.2
+
+# ─── MLOps ───────────────────────────────────────────────────
+mlflow==2.10.2
+feast==0.36.1
+evidently==0.4.13
+great-expectations==0.18.10
+
+# ─── Database & Cache ─────────────────────────────────────────
+asyncpg==0.29.0
+sqlalchemy[asyncio]==2.0.25
+alembic==1.13.1
+redis[hiredis]==5.0.1
+aioredis==2.0.1
+
+# ─── Messaging ───────────────────────────────────────────────
+aiokafka==0.10.0
+confluent-kafka==2.3.0
+
+# ─── Observability ────────────────────────────────────────────
+prometheus-fastapi-instrumentator==6.1.0
+opentelemetry-sdk==1.22.0
+opentelemetry-exporter-jaeger==1.21.0
+opentelemetry-instrumentation-fastapi==0.43b0
+structlog==24.1.0
+
+# ─── HTTP Client ─────────────────────────────────────────────
+httpx==0.26.0
+aiohttp==3.9.3
+
+# ─── Utilities ────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.0
+pytz==2024.1
+geopy==2.4.1
