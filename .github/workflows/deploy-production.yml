@@ -1,0 +1,412 @@
+name: 🌟 Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (leave empty for latest)'
+        required: false
+        default: ''
+      skip_validation:
+        description: 'Skip model validation (emergency deploys only)'
+        required: false
+        default: 'false'
+
+env:
+  AWS_REGION:     us-east-1
+  ECR_REGISTRY:   ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: weather-ml-api
+  EKS_CLUSTER:    weather-ml-prod
+  NAMESPACE:      weather-ml
+
+jobs:
+  # ─── 1. Code Quality ─────────────────────────────────────────
+  quality:
+    name: 🔍 Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dev dependencies
+        run: pip install ruff black mypy bandit safety
+
+      - name: Lint with Ruff
+        run: ruff check app/ model/
+
+      - name: Format check with Black
+        run: black --check app/ model/
+
+      - name: Type check with MyPy
+        run: mypy app/ --ignore-missing-imports
+
+      - name: Security scan with Bandit
+        run: bandit -r app/ -f json -o bandit-report.json
+
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v3
+        with:
+          name: bandit-report-prod
+          path: bandit-report.json
+
+      - name: Dependency vulnerability scan
+        run: safety check -r requirements.txt
+
+  # ─── 2. Tests ────────────────────────────────────────────────
+  test:
+    name: 🧪 Tests
+    runs-on: ubuntu-latest
+    needs: quality
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB:       weatherdb_test
+          POSTGRES_USER:     weather
+          POSTGRES_PASSWORD: weather123
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio pytest-cov httpx
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ -v \
+            --cov=app             \
+            --cov-report=xml      \
+            --cov-report=term-missing
+
+      - name: Enforce coverage threshold
+        run: |
+          pytest tests/unit/ \
+            --cov=app          \
+            --cov-fail-under=80
+
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql://weather:weather123@localhost:5432/weatherdb_test
+          REDIS_URL:    redis://localhost:6379/0
+        run: |
+          pytest tests/test_api.py -v --timeout=60
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          file:  coverage.xml
+          flags: production
+
+  # ─── 3. Model Validation (stricter thresholds for prod) ──────
+  model-validation:
+    name: 🤖 Model Validation
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event.inputs.skip_validation != 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install ML dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate model performance
+        run: |
+          python scripts/validate_model.py \
+            --min-r2=0.85                  \
+            --max-rmse=3.0                 \
+            --model-path=./model           \
+            --summary
+
+      - name: Upload validation report
+        uses: actions/upload-artifact@v3
+        with:
+          name: model-validation-prod
+          path: validation_report.json
+
+      - name: Check for data drift
+        run: |
+          python scripts/check_data_drift.py \
+            --reference-data=data/reference_dataset.csv \
+            --threshold=0.10
+
+      - name: Assert no critical drift
+        run: |
+          python -c "
+          import json, sys
+          with open('drift_report.json') as f:
+              report = json.load(f)
+          critical = [f for f in report['features'] if f['drift_score'] > 0.25]
+          if critical:
+              print('CRITICAL DRIFT detected in:', [f['name'] for f in critical])
+              sys.exit(1)
+          print('No critical drift detected ✅')
+          "
+
+  # ─── 4. Build & Push Image ───────────────────────────────────
+  build:
+    name: 🐳 Build & Push Image
+    runs-on: ubuntu-latest
+    needs: [test, model-validation]
+    if: |
+      always() &&
+      needs.test.result == 'success' &&
+      (needs.model-validation.result == 'success' ||
+       needs.model-validation.result == 'skipped')
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=ref,event=branch
+            type=raw,value=prod-latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context:    .
+          push:       true
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          platforms:  linux/amd64,linux/arm64
+
+      - name: Scan image — block on CRITICAL
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:    ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}
+          format:       sarif
+          output:       trivy-results.sarif
+          severity:     CRITICAL
+          exit-code:    1
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ─── 5. Deploy to Production ─────────────────────────────────
+  deploy:
+    name: 🌟 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: production
+      url:  https://weather-api.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Snapshot current release (for rollback)
+        run: |
+          helm get values weather-api \
+            -n ${{ env.NAMESPACE }} > previous-values.yaml || true
+
+          kubectl get deployment weather-api \
+            -n ${{ env.NAMESPACE }}          \
+            -o yaml > previous-deployment.yaml || true
+
+      - name: Upload rollback snapshot
+        uses: actions/upload-artifact@v3
+        with:
+          name: rollback-snapshot-${{ github.sha }}
+          path: |
+            previous-values.yaml
+            previous-deployment.yaml
+
+      - name: Deploy with Helm (atomic — auto-rollback on failure)
+        run: |
+          helm upgrade --install weather-api ./helm/weather-api \
+            --namespace ${{ env.NAMESPACE }}                    \
+            --create-namespace                                  \
+            --set image.tag=${{ needs.build.outputs.image-tag }} \
+            --set environment=prod                              \
+            --set replicaCount=3                               \
+            --values helm/weather-api/values-prod.yaml         \
+            --atomic --wait --timeout=10m
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/weather-api \
+            -n ${{ env.NAMESPACE }}
+
+          kubectl get pods -n ${{ env.NAMESPACE }} \
+            -l app=weather-api
+
+      - name: Run production smoke tests
+        run: |
+          BASE=https://weather-api.example.com
+
+          echo "→ Liveness probe"
+          curl -sf $BASE/health/live
+
+          echo "→ Readiness probe"
+          curl -sf $BASE/health/ready
+
+          echo "→ Full health check"
+          curl -sf $BASE/health/ | python -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert data['status'] == 'healthy', f'Unhealthy: {data}'
+          assert data['model_loaded'],        'Model not loaded!'
+          print('Health check passed ✅')
+          "
+
+          echo "→ Forecast endpoint"
+          curl -sf -X POST $BASE/api/v1/forecast/ \
+            -H "Content-Type: application/json"   \
+            -d '{"latitude":40.7128,"longitude":-74.006,"days":7}' \
+          | python -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert len(data['forecast']) == 7, 'Wrong forecast length!'
+          print('Forecast endpoint passed ✅')
+          "
+
+      - name: Tag release in Git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "deploy-${{ needs.build.outputs.image-tag }}" \
+            -m "Production deployment ${{ needs.build.outputs.image-tag }}"
+          git push origin --tags
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: '#mlops-deployments'
+          slack-message: |
+            ✅ *Weather ML API* deployed to *production*
+            • Version : `${{ needs.build.outputs.image-tag }}`
+            • Commit  : `${{ github.sha }}`
+            • By      : ${{ github.actor }}
+            • URL     : https://weather-api.example.com
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: '#mlops-deployments'
+          slack-message: |
+            ❌ *Weather ML API* production deployment FAILED — Helm rolled back automatically
+            • Version : `${{ needs.build.outputs.image-tag }}`
+            • Commit  : `${{ github.sha }}`
+            • By      : ${{ github.actor }}
+            • Logs    : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  # ─── 6. Weekly Model Retraining ──────────────────────────────
+  retrain-model:
+    name: 🔄 Retrain ML Model
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Trigger retraining Kubernetes Job
+        run: |
+          JOB_NAME="manual-retrain-$(date +%Y%m%d)"
+          kubectl create job             \
+            --from=cronjob/weather-model-retrain \
+            $JOB_NAME                    \
+            -n ${{ env.NAMESPACE }}
+          echo "JOB_NAME=$JOB_NAME" >> $GITHUB_ENV
+
+      - name: Wait for training to complete
+        run: |
+          kubectl wait                      \
+            --for=condition=complete        \
+            job/${{ env.JOB_NAME }}         \
+            -n ${{ env.NAMESPACE }}         \
+            --timeout=3600s
+
+      - name: Fetch training logs
+        if: always()
+        run: |
+          kubectl logs                      \
+            -l job-name=${{ env.JOB_NAME }} \
+            -n ${{ env.NAMESPACE }}
+
+     
